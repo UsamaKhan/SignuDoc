@@ -3,8 +3,10 @@
 import { useEffect, useRef, useState } from "react";
 
 import {
+  fetchPdfBytes,
   loadPdfJsModule,
   PDF_JS_STANDARD_FONT_DATA_URL,
+  startPdfJsWorker,
 } from "@/lib/pdfjs-client";
 
 type PdfJsModule = Awaited<ReturnType<typeof loadPdfJsModule>>;
@@ -12,6 +14,7 @@ type PdfDocumentProxy = Awaited<
   ReturnType<PdfJsModule["getDocument"]>["promise"]
 >;
 type PdfPageProxy = Awaited<ReturnType<PdfDocumentProxy["getPage"]>>;
+type PdfWorker = ReturnType<PdfJsModule["PDFWorker"]["create"]>;
 type PdfRenderTask = ReturnType<PdfPageProxy["render"]>;
 export type PdfPageRenderState = "error" | "loading" | "ready";
 
@@ -92,8 +95,33 @@ export function PdfPageCanvas({
 
   useEffect(() => {
     let isActive = true;
-    let activeDocument: PdfDocumentProxy | null = null;
     let loadingTask: ReturnType<PdfJsModule["getDocument"]> | null = null;
+    let worker: PdfWorker | null = null;
+    const abortController = new AbortController();
+    // Given a URL, pdf.js downloads its own code, then its worker, then the
+    // PDF, each only after the one before. Asking for all three here lets
+    // them download at the same time.
+    const workerStart = documentUrl
+      ? startPdfJsWorker(abortController.signal)
+      : null;
+
+    let isReleased = false;
+
+    // pdf.js closes a worker it started and leaves one it was given, so
+    // ours is closed here, after the document: closing the document sends
+    // the worker a final message.
+    function release() {
+      if (isReleased) {
+        return;
+      }
+
+      isReleased = true;
+      abortController.abort();
+      void Promise.allSettled([loadingTask?.destroy()]).then(async () => {
+        worker?.destroy();
+        (await workerStart)?.terminate();
+      });
+    }
 
     async function loadDocument() {
       setRenderState("loading");
@@ -104,22 +132,35 @@ export function PdfPageCanvas({
       }
 
       try {
-        const pdfjs = await loadPdfJsModule();
+        const [pdfjs, workerPort, pdfBytes] = await Promise.all([
+          loadPdfJsModule(),
+          workerStart,
+          fetchPdfBytes(documentUrl, abortController.signal),
+        ]);
+
+        if (!isActive) {
+          return;
+        }
+
+        worker = workerPort
+          ? pdfjs.PDFWorker.create({ port: workerPort })
+          : null;
         loadingTask = pdfjs.getDocument({
+          data: pdfBytes,
           standardFontDataUrl: PDF_JS_STANDARD_FONT_DATA_URL,
-          url: documentUrl,
+          // Without one, pdf.js starts its own.
+          ...(worker ? { worker } : {}),
         });
         const nextDocument = await loadingTask.promise;
 
         if (!isActive) {
-          await nextDocument.destroy();
           return;
         }
 
-        activeDocument = nextDocument;
         setDocumentProxy(nextDocument);
       } catch (error) {
         if (isActive) {
+          release();
           console.error("Failed to load the PDF preview document.", error);
           setDocumentProxy(null);
           setRenderState("error");
@@ -131,8 +172,7 @@ export function PdfPageCanvas({
 
     return () => {
       isActive = false;
-      loadingTask?.destroy();
-      void activeDocument?.destroy();
+      release();
     };
   }, [documentUrl]);
 

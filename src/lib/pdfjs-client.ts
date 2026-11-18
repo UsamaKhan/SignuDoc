@@ -52,6 +52,61 @@ export async function loadPdfJsModule(): Promise<PdfJsModule> {
   return pdfJsModulePromise;
 }
 
+/**
+ * Starts the pdf.js worker without waiting for pdf.js itself. Left to
+ * itself pdf.js starts the worker only once its own code has arrived, and
+ * the worker is the largest download on a page that shows a PDF.
+ *
+ * Resolves once the worker is running. Resolves to null if it could not be
+ * started, and pdf.js then starts one its own way. Aborting `signal` before
+ * then stops the worker and also resolves to null.
+ */
+export function startPdfJsWorker(signal: AbortSignal): Promise<Worker | null> {
+  return new Promise((resolve) => {
+    let worker: Worker;
+
+    try {
+      worker = new Worker(PDF_JS_WORKER_SRC, { type: "module" });
+    } catch {
+      resolve(null);
+      return;
+    }
+
+    // The listeners go once one has fired: an error later on, while a
+    // document is open, is for pdf.js to deal with as it always has.
+    const settled = new AbortController();
+    const settle = (started: Worker | null) => {
+      settled.abort();
+      resolve(started);
+    };
+    const giveUp = () => {
+      worker.terminate();
+      settle(null);
+    };
+
+    // The worker says "ready" as soon as its script has run.
+    worker.addEventListener("message", () => settle(worker), {
+      signal: settled.signal,
+    });
+    worker.addEventListener("error", giveUp, { signal: settled.signal });
+    signal.addEventListener("abort", giveUp, { signal: settled.signal });
+  });
+}
+
+/** Fetches a PDF whole, the way pdf.js does when it is given a URL. */
+export async function fetchPdfBytes(
+  url: string,
+  signal: AbortSignal,
+): Promise<Uint8Array> {
+  const response = await fetch(url, { signal });
+
+  if (!response.ok) {
+    throw new Error(`The PDF could not be fetched (${response.status}).`);
+  }
+
+  return new Uint8Array(await response.arrayBuffer());
+}
+
 export async function assertPdfPreviewRenderable(
   file: File | Uint8Array,
 ): Promise<void> {
